@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+
+if DISK_DRIVERS
+
+rsource "Kconfig.sdmmc_amebapro2"
+
+endif # DISK_DRIVERS

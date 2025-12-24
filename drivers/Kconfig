@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+
+rsource "serial/Kconfig"
+rsource "entropy/Kconfig"
+rsource "pinctrl/Kconfig"
+rsource "spi/Kconfig"
+rsource "flash/Kconfig"
+rsource "i2c/Kconfig"
+rsource "gpio/Kconfig"
+rsource "disk/Kconfig"
+rsource "video/Kconfig"
+rsource "audio/Kconfig"

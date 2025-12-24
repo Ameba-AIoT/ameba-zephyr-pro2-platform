@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+
+if AUDIO_DMIC
+
+rsource "Kconfig.amebapro2_dmic"
+
+endif # AUDIO_DMIC
