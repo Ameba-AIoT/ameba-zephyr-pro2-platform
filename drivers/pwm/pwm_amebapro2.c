@@ -20,10 +20,11 @@
 
 LOG_MODULE_REGISTER(pwm_ameba, CONFIG_PWM_LOG_LEVEL);
 
-static u8 timer_for_pwm_temp[] = {GTimer0, GTimer1, GTimer2, GTimer3, GTimer4, GTimer5, GTimer6, GTimer7, 0xff};  /* the timer ID list those can be used as PWM tick source*/
+static uint8_t timer_for_pwm_temp[] = {GTimer0, GTimer1, GTimer2, GTimer3, GTimer4, GTimer5, GTimer6, GTimer7, 0xff};  /* the timer ID list those can be used as PWM tick source*/
 static hal_pwm_comm_adapter_t pwm_com_handler;
 static hal_timer_group_adapter_t _timer_group0;
 static hal_pwm_adapter_t pwm_c0, pwm_c1, pwm_c2, pwm_c8, pwm_c9;
+static bool pwm_c0_initd = false, pwm_c1_initd = false, pwm_c2_initd = false, pwm_c8_initd = false, pwm_c9_initd = false;
 
 struct pwm_ameba_data {
 	uint16_t prescale;
@@ -55,15 +56,50 @@ static int pwm_ameba_set_cycles(const struct device *dev, uint32_t channel_idx,
 	duty_us = pulse_cycles / 40;
 
 	if (channel_idx == 0) {
-		hal_pwm_set_duty(&pwm_c0, period_us, duty_us, 0);
+		if (pwm_c0_initd) {
+			hal_pwm_set_duty(&pwm_c0, period_us, duty_us, 0);
+		} else {
+			hal_pwm_init(&pwm_c0, 0, 0, 0);  /* PIN_F6 */
+			hal_pwm_set_duty(&pwm_c0, period_us, duty_us, 0);
+			hal_pwm_enable(&pwm_c0);
+			pwm_c0_initd = true;
+		}
 	} else if (channel_idx == 1) {
-		hal_pwm_set_duty(&pwm_c1, period_us, duty_us, 0);
+		if (pwm_c1_initd) {
+			hal_pwm_set_duty(&pwm_c1, period_us, duty_us, 0);
+		} else {
+			hal_pwm_init(&pwm_c1, 1, 0, 0);  /* PIN_F7 */
+			hal_pwm_set_duty(&pwm_c1, period_us, duty_us, 0);
+			hal_pwm_enable(&pwm_c1);
+			pwm_c1_initd = true;
+		}
 	} else if (channel_idx == 2) {
-		hal_pwm_set_duty(&pwm_c2, period_us, duty_us, 0);
+		if (pwm_c2_initd) {
+			hal_pwm_set_duty(&pwm_c2, period_us, duty_us, 0);
+		} else {
+			hal_pwm_init(&pwm_c2, 2, 0, 0);  /* PIN_F8 */
+			hal_pwm_set_duty(&pwm_c2, period_us, duty_us, 0);
+			hal_pwm_enable(&pwm_c2);
+			pwm_c2_initd = true;
+		}
 	} else if (channel_idx == 8) {
-		hal_pwm_set_duty(&pwm_c8, period_us, duty_us, 0);
+		if (pwm_c8_initd) {
+			hal_pwm_set_duty(&pwm_c8, period_us, duty_us, 0);
+		} else {
+			hal_pwm_init(&pwm_c8, 8, 0, 0);  /* PIN_F14 */
+			hal_pwm_set_duty(&pwm_c8, period_us, duty_us, 0);
+			hal_pwm_enable(&pwm_c8);
+			pwm_c8_initd = true;
+		}
 	} else if (channel_idx == 9) {
-		hal_pwm_set_duty(&pwm_c9, period_us, duty_us, 0);
+		if (pwm_c9_initd) {
+			hal_pwm_set_duty(&pwm_c9, period_us, duty_us, 0);
+		} else {
+			hal_pwm_init(&pwm_c9, 9, 0, 0);  /* PIN_F15 */
+			hal_pwm_set_duty(&pwm_c9, period_us, duty_us, 0);
+			hal_pwm_enable(&pwm_c9);
+			pwm_c9_initd = true;
+		}
 	} else {
 		LOG_ERR("Invalid PWM channel_idx (%d)\n", channel_idx);
 	}
@@ -82,25 +118,6 @@ int pwm_ameba_init(const struct device *dev)
 	hal_pwm_comm_init(&pwm_com_handler);
 	hal_pwm_comm_tick_source_list(timer_for_pwm_temp);
 
-	hal_pwm_init(&pwm_c0, 0, 0, 0);  /* PIN_F6 */
-	hal_pwm_set_duty(&pwm_c0, 50, 0, 0); /* 20khz 0% */
-	hal_pwm_enable(&pwm_c0);
-
-	hal_pwm_init(&pwm_c1, 1, 0, 0);  /* PIN_F7 */
-	hal_pwm_set_duty(&pwm_c1, 50, 0, 0); /* 20khz 0% */
-	hal_pwm_enable(&pwm_c1);
-
-	hal_pwm_init(&pwm_c2, 2, 0, 0);  /* PIN_F8 */
-	hal_pwm_set_duty(&pwm_c2, 50, 0, 0); /* 20khz 0% */
-	hal_pwm_enable(&pwm_c2);
-
-	hal_pwm_init(&pwm_c8, 8, 0, 0);  /* PIN_F14 */
-	hal_pwm_set_duty(&pwm_c8, 50, 0, 0); /* 20khz 0% */
-	hal_pwm_enable(&pwm_c8);
-
-	hal_pwm_init(&pwm_c9, 9, 0, 0);  /* PIN_F15 */
-	hal_pwm_set_duty(&pwm_c9, 50, 0, 0); /* 20khz 0% */
-	hal_pwm_enable(&pwm_c9);
 	return 0;
 }
 

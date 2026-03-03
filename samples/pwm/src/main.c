@@ -13,11 +13,11 @@
 
 static const struct device *pwm_dev = DEVICE_DT_GET(DT_NODELABEL(pwm));
 
-#define PWM_CHANNEL_0 0
-#define PWM_CHANNEL_1 1
-#define PWM_CHANNEL_2 2
-#define PWM_CHANNEL_8 8
-#define PWM_CHANNEL_9 9
+#define PWM_CHANNEL_0 0 /* PIN_F6 */
+#define PWM_CHANNEL_1 1 /* PIN_F7 */
+#define PWM_CHANNEL_2 2 /* PIN_F8 */
+#define PWM_CHANNEL_8 8 /* PIN_F14 */
+#define PWM_CHANNEL_9 9 /* PIN_F15 */
 
 /* 40 MHz clock, 20 kHz PWM */
 uint32_t period_cycles = 2000;   /* 40MHz / 20kHz */
