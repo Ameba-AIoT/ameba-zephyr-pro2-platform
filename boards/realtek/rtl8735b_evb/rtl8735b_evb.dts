@@ -119,3 +119,7 @@
 &dmic {
 	status = "okay";
 };
+
+&pwm {
+	status = "okay";
+};

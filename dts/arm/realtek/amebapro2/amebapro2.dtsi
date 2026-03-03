@@ -101,6 +101,13 @@
 			status = "disabled";
 		};
 
+		pwm: pwm@40045000 {
+			compatible = "realtek,amebapro2-pwm";
+			reg = <0x40045000 0x180>;
+			#pwm-cells = <3>;
+			status = "disabled";
+		};
+
 		spic: flash-controller@40006000 {
 			compatible = "realtek,amebapro2-flash-controller";
 			reg = <0x40006000 0x12c>;

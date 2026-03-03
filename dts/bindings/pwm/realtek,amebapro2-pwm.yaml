@@ -1,0 +1,17 @@
+# Copyright (c) 2024 Realtek Semiconductor Corp.
+# SPDX-License-Identifier: Apache-2.0
+
+description: AMEBAPRO2 PWM
+
+compatible: "realtek,amebapro2-pwm"
+
+include: [pwm-controller.yaml, base.yaml, pinctrl-device.yaml]
+
+properties:
+  reg:
+    required: true
+
+pwm-cells:
+  - channel
+  - period
+  - flags
