@@ -108,6 +108,13 @@
 			status = "disabled";
 		};
 
+		adc: adc@40010000 {
+			compatible = "realtek,amebapro2-adc";
+			reg = <0x40010000 0xc0>;
+			#io-channel-cells = <1>;
+			status = "disabled";
+		};
+
 		spic: flash-controller@40006000 {
 			compatible = "realtek,amebapro2-flash-controller";
 			reg = <0x40006000 0x12c>;
