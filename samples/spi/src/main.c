@@ -26,6 +26,8 @@ struct test_data {
 	bool async;
 };
 
+volatile int spi_busy;
+
 static struct test_data tdata;
 
 static const struct device *spi_dev = DEVICE_DT_GET(DT_NODELABEL(spi0));
@@ -40,7 +42,15 @@ static const struct spi_config spi0_config = {
 
 };
 
-static void test_only_tx(bool async)
+static void spi_async_cb(const struct device *dev, int result, void *data)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(data);
+	printf("spi_Tx/Rx done\n\r");
+	spi_busy = 0;
+}
+
+static void test_master_trx(bool async)
 {
 	size_t len = 16;
 
@@ -64,8 +74,14 @@ static void test_only_tx(bool async)
 	tdata.mrx_set = &tdata.sets[1];
 
 	printf("spi_tx!\n\r");
+	if (async) {
+		spi_busy = 1;
+		spi_transceive_cb(spi_dev, &spi0_config, tdata.mtx_set, tdata.mrx_set, spi_async_cb, NULL);
+		while (spi_busy);
+	} else {
+		spi_transceive(spi_dev, &spi0_config, tdata.mtx_set, tdata.mrx_set);
 
-	spi_transceive(spi_dev, &spi0_config, tdata.mtx_set, tdata.mrx_set);
+	}
 	spi_release(spi_dev, &spi0_config);
 	hal_delay_us(5000000);
 
@@ -86,7 +102,13 @@ static void test_only_tx(bool async)
 	tdata.mrx_set = &tdata.sets[1];
 
 	printf("spi_rx!\n\r");
-	spi_transceive(spi_dev, &spi0_config, tdata.mtx_set, tdata.mrx_set);
+	if (async) {
+		spi_busy = 1;
+		spi_transceive_cb(spi_dev, &spi0_config, tdata.mtx_set, tdata.mrx_set, spi_async_cb, NULL);
+		while (spi_busy);
+	} else {
+		spi_transceive(spi_dev, &spi0_config, tdata.mtx_set, tdata.mrx_set);
+	}
 
 	for (int i = 0; i < len; i++) {
 		printf("test_buf_rx [i] = 0x%x\n\r", test_buf_rx[i]);
@@ -100,7 +122,7 @@ int main(void)
 {
 	printf("SPI example! %s\n", CONFIG_BOARD_TARGET);
 
-	test_only_tx(false);
+	test_master_trx(true);
 
 	return 0;
 }

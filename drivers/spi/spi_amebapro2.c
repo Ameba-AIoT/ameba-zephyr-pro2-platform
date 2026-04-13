@@ -42,12 +42,36 @@ struct spi_ameba_config {
 
 hal_ssi_adaptor_t hal_ssi_adaptor;
 
+static spi_callback_t g_spi_cb;
+static void *g_spi_userdata;
+static const struct device *g_spi_dev;
+
 #if defined(CONFIG_SPI_AMEBAPRO2_DMA)
 hal_gdma_adaptor_t spi_gdma_adp_tx;
 hal_gdma_adaptor_t spi_gdma_adp_rx;
 #endif
 
 static int spi_dma_en;
+
+static void spi_bus_tx_done_callback(void *para)
+{
+	if (g_spi_cb) {
+		g_spi_cb(g_spi_dev, 0, g_spi_userdata);
+	}
+}
+
+static void spi_tx_done_callback(void *para)
+{
+
+}
+
+static void spi_rx_done_callback(void *para)
+{
+	if (g_spi_cb) {
+		g_spi_cb(g_spi_dev, 0, g_spi_userdata);
+	}
+}
+
 
 /**static int spi_ameba_frame_exchange(const struct device *dev)
  *{
@@ -101,6 +125,15 @@ static int spi_ameba_configure(const struct device *dev, const struct spi_config
 		}
 	}
 
+#ifdef CONFIG_SPI_ASYNC
+	hal_ssi_adaptor.tx_done_callback = spi_tx_done_callback;
+	hal_ssi_adaptor.tx_done_cb_para = (void *)dev;
+	hal_ssi_adaptor.rx_done_callback = spi_rx_done_callback;
+	hal_ssi_adaptor.rx_done_cb_para = (void *)dev;
+	hal_ssi_adaptor.tx_idle_callback = spi_bus_tx_done_callback;
+	hal_ssi_adaptor.tx_idle_cb_para = (void *)dev;
+#endif /* CONFIG_SPI_ASYNC */
+
 	/*Initialize ISR setting to prevent from inadvert effects*/
 	hal_ssi_set_interrupt_mask(&hal_ssi_adaptor, 0);
 
@@ -136,6 +169,11 @@ static int spi_ameba_transceive_impl(const struct device *dev, const struct spi_
 	int ret = 0;
 
 	spi_ameba_configure(dev, spi_cfg);
+#ifdef CONFIG_SPI_ASYNC
+	g_spi_cb = cb;
+	g_spi_userdata = userdata;
+	g_spi_dev = dev;
+#endif /* CONFIG_SPI_ASYNC */
 
 	/* wait bus idle*/
 	while (hal_ssi_get_busy(&hal_ssi_adaptor)) {
@@ -205,10 +243,11 @@ static int spi_ameba_transceive_impl(const struct device *dev, const struct spi_
 	} else {
 		/*slave*/
 	}
-
+#if !defined(CONFIG_SPI_ASYNC) || (CONFIG_SPI_ASYNC == 0)
 	while (hal_ssi_get_busy(&hal_ssi_adaptor)) {
 		/* Wait until last frame transfer complete. */
 	}
+#endif
 
 #ifdef CONFIG_SPI_AMEBAPRO2_DMA
 dma_error:
@@ -244,7 +283,20 @@ static int spi_ameba_transceive(const struct device *dev, const struct spi_confi
 	return spi_ameba_transceive_impl(dev, spi_cfg, tx_bufs, rx_bufs, false, NULL, NULL);
 }
 
+#ifdef CONFIG_SPI_ASYNC
+static int spi_ameba_transceive_async(const struct device *dev, const struct spi_config *spi_cfg,
+									  const struct spi_buf_set *tx_bufs,
+									  const struct spi_buf_set *rx_bufs, spi_callback_t cb,
+									  void *userdata)
+{
+	return spi_ameba_transceive_impl(dev, spi_cfg, tx_bufs, rx_bufs, true, cb, userdata);
+}
+#endif /* CONFIG_SPI_ASYNC */
+
 static const struct spi_driver_api ameba_spi_api = {.transceive = spi_ameba_transceive,
+#ifdef CONFIG_SPI_ASYNC
+		   .transceive_async = spi_ameba_transceive_async,
+#endif /* CONFIG_SPI_ASYNC */
 		   .release = spi_ameba_release
 };
 
