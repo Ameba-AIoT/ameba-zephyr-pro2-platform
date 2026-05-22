@@ -31,17 +31,26 @@ void set_adc_channel(uint8_t ch)
 	adc_channel_setup(adc_dev, &channel_cfg);
 }
 
+#define ADC_SAMPLE_COUNT 3
+
 void read_adc_channel(uint8_t ch)
 {
-	int16_t sample_buffer;
+	uint16_t sample_buffer[ADC_SAMPLE_COUNT];
 	struct adc_sequence sequence = {
-		.channels = ch,
-		.buffer = &sample_buffer,
+		.channels = BIT(ch),
+		.buffer = sample_buffer,
 		.buffer_size = sizeof(sample_buffer),
 	};
+	uint32_t sum = 0;
 
 	adc_read(adc_dev, &sequence);
-	printk("ADC channel: %d, value: %d\n", ch, sample_buffer);
+
+	for (int i = 0; i < ADC_SAMPLE_COUNT; i++) {
+		printk("ADC channel: %d, sample[%d]: %u\n", ch, i, sample_buffer[i]);
+		sum += sample_buffer[i];
+	}
+	printk("ADC channel: %d, average (%d samples): %u\n", ch, ADC_SAMPLE_COUNT,
+		   (uint32_t)(sum / ADC_SAMPLE_COUNT));
 }
 
 static void test_adc(bool async)

@@ -41,13 +41,20 @@ struct adc_ameba_data {
 static int adc_ameba_read(const struct device *dev, const struct adc_sequence *seq)
 {
 	struct adc_ameba_data *data = dev->data;
-	uint16_t anain16;
+	uint16_t *buf = (uint16_t *)seq->buffer;
+	size_t total_samples = seq->buffer_size / sizeof(uint16_t);
 
-	anain16 = hal_adc_single_read(&analogin_con_adpt, seq->channels);
+	if (total_samples == 0) {
+		return -ENOMEM;
+	}
 
-	/* Store result */
-	data->buffer = (uint16_t *)seq->buffer;
-	data->buffer[0] = anain16;
+	data->buffer = buf;
+
+	uint8_t channel_id = find_lsb_set(seq->channels) - 1;
+
+	for (size_t i = 0; i < total_samples; i++) {
+		buf[i] = hal_adc_single_read(&analogin_con_adpt, channel_id);
+	}
 
 	return 0;
 }
