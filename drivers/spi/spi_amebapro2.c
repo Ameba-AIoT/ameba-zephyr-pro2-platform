@@ -42,9 +42,11 @@ struct spi_ameba_config {
 
 hal_ssi_adaptor_t hal_ssi_adaptor;
 
+#ifdef CONFIG_SPI_ASYNC
 static spi_callback_t g_spi_cb;
 static void *g_spi_userdata;
 static const struct device *g_spi_dev;
+#endif
 
 #if defined(CONFIG_SPI_AMEBAPRO2_DMA)
 hal_gdma_adaptor_t spi_gdma_adp_tx;
@@ -53,6 +55,7 @@ hal_gdma_adaptor_t spi_gdma_adp_rx;
 
 static int spi_dma_en;
 
+#ifdef CONFIG_SPI_ASYNC
 static void spi_bus_tx_done_callback(void *para)
 {
 	if (g_spi_cb) {
@@ -71,7 +74,7 @@ static void spi_rx_done_callback(void *para)
 		g_spi_cb(g_spi_dev, 0, g_spi_userdata);
 	}
 }
-
+#endif /* CONFIG_SPI_ASYNC */
 
 /**static int spi_ameba_frame_exchange(const struct device *dev)
  *{
