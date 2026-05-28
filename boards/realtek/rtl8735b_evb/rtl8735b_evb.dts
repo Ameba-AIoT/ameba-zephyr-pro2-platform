@@ -127,3 +127,7 @@
 &adc {
 	status = "okay";
 };
+
+&npu {
+	status = "okay";
+};

@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config AMEBA_NPU
+	bool "Realtek Ameba NPU Driver"
+	default n
+
+config NPU_AMEBAPRO2
+	bool "Realtek AmebaPro2 NPU driver"
+	depends on AMEBA_NPU && DT_HAS_REALTEK_AMEBAPRO2_NPU_ENABLED
+	default y
+	select CACHE_MANAGEMENT
+	help
+	  Enable the Zephyr-facing Ameba NPU API wrapper.
+
+if NPU_AMEBAPRO2
+
+module = AMEBA_NPU
+module-str = ameba_npu
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # NPU_AMEBAPRO2

@@ -1,0 +1,19 @@
+# Copyright (c) 2026 Realtek Semiconductor Corp.
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Realtek AmebaPro2 NPU frontend.
+
+  The Zephyr device instance describes the board-specific NPU register base and
+  interrupt line.
+
+compatible: "realtek,amebapro2-npu"
+
+include: [base.yaml]
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true

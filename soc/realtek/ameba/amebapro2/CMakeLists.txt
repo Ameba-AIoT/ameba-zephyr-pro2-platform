@@ -7,5 +7,6 @@ zephyr_include_directories(.)
 zephyr_sources(soc.c)
 
 zephyr_linker_sources(SECTIONS boot_section.ld)
+zephyr_linker_sources(SECTIONS nn_eram.ld)
 set(SOC_LINKER_SCRIPT ${ZEPHYR_BASE}/include/zephyr/arch/arm/cortex_m/scripts/linker.ld CACHE INTERNAL "")
 zephyr_link_libraries(-T${CMAKE_CURRENT_SOURCE_DIR}/romsym_is.ld)

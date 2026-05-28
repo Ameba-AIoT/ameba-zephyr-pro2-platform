@@ -195,6 +195,13 @@
 			status = "disabled";
 			label = "DMIC_AMEBAPRO2";
 		};
+
+		npu: npu@40580000 {
+			compatible = "realtek,amebapro2-npu";
+			reg = <0x40580000 0x1000>;
+			interrupts = <41 0>;
+			status = "disabled";
+		};
 	};
 };
 
