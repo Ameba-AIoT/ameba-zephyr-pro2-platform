@@ -1,0 +1,45 @@
+# Copyright (c) 2024 Realtek Semiconductor Corp.
+# SPDX-License-Identifier: Apache-2.0
+
+description: Amebapro2 Video Channel
+
+compatible: "realtek,amebapro2-video-channel"
+
+include: [base.yaml]
+
+properties:
+  reg:
+    required: true
+
+  interrupts:
+    required: true
+
+  label:
+    required: true
+
+  default-width:
+    type: int
+    description: Default frame width in pixels
+
+  default-height:
+    type: int
+    description: Default frame height in pixels
+
+  default-fps:
+    type: int
+    description: Default frame rate
+
+  default-video-type:
+    type: int
+    description: >
+      Default encode type. Use constants from
+      dt-bindings/video/amebapro2_video.h:
+      AMEBAPRO2_VIDEO_TYPE_HEVC, _H264, _JPEG, _NV12.
+
+  default-out-mode:
+    type: int
+    description: >
+      VOE output mode. Use constants from
+      dt-bindings/video/amebapro2_video.h:
+      AMEBAPRO2_VIDEO_OUT_MODE_DEFAULT or _CONTINUOUS.
+

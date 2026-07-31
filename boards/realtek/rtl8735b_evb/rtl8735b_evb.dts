@@ -8,6 +8,7 @@
 
 #include <realtek/amebapro2/amebapro2.dtsi>
 #include "rtl8735b_evb-pinctrl.dtsi"
+#include <dt-bindings/video/amebapro2_video.h>
 
 / {
 	model = "RealTek AmebaPro2 RTL8735B EVB";
@@ -93,14 +94,21 @@
 
 &video_channel0 {
 	status = "okay";
+	default-video-type = <AMEBAPRO2_VIDEO_TYPE_HEVC>;
 };
 
 &video_channel1 {
 	status = "okay";
+	default-video-type = <AMEBAPRO2_VIDEO_TYPE_H264>;
 };
 
 &video_channel2 {
-	status = "disabled";
+	status = "okay";
+	default-video-type = <AMEBAPRO2_VIDEO_TYPE_NV12>;
+	default-width = <320>;
+	default-height = <180>;
+	default-fps = <10>;
+	default-out-mode = <AMEBAPRO2_VIDEO_OUT_MODE_CONTINUOUS>;
 };
 
 &video_channel3 {

@@ -15,6 +15,13 @@
 #include <zephyr/drivers/video-controls.h>
 #include <zephyr/logging/log.h>
 #include <video_api.h>
+#include <zephyr/dt-bindings/video/amebapro2_video.h>
+
+/* Ensure DT binding constants stay in sync with encode_type enum in video_api.h */
+BUILD_ASSERT(AMEBAPRO2_VIDEO_TYPE_HEVC == VIDEO_HEVC, "HEVC type mismatch");
+BUILD_ASSERT(AMEBAPRO2_VIDEO_TYPE_H264 == VIDEO_H264, "H264 type mismatch");
+BUILD_ASSERT(AMEBAPRO2_VIDEO_TYPE_JPEG == VIDEO_JPEG, "JPEG type mismatch");
+BUILD_ASSERT(AMEBAPRO2_VIDEO_TYPE_NV12 == VIDEO_NV12, "NV12 type mismatch");
 
 #include "video_ctrls.h"
 #include "video_device.h"
@@ -50,6 +57,8 @@ struct video_channel_config {
 	uint16_t default_width;
 	uint16_t default_height;
 	uint8_t default_fps;
+	uint8_t default_video_type; /* enum encode_type: VIDEO_HEVC/H264/JPEG/NV12 */
+	uint8_t default_out_mode;   /* VOE output mode: 0=default, 2=continuous */
 	const char *label;
 	uint8_t stream_id;
 };
@@ -78,6 +87,15 @@ static const struct video_format_cap fmts[] = {
 	},
 	{
 		.pixelformat = VIDEO_PIX_FMT_JPEG,
+		.width_min = 64,
+		.width_max = 1920,
+		.height_min = 64,
+		.height_max = 1080,
+		.width_step = 16,
+		.height_step = 16,
+	},
+	{
+		.pixelformat = VIDEO_PIX_FMT_NV12,
 		.width_min = 64,
 		.width_max = 1920,
 		.height_min = 64,
@@ -203,7 +221,19 @@ static void video_output_cb(void *param1, void *param2, uint32_t arg)
 			k_fifo_put(&ctx->fifo_out, vbuf);
 		}
 	} else if ((enc2out->codec & (CODEC_NV12 | CODEC_RGB | CODEC_NV16)) != 0) {
-		video_ispbuf_release(enc2out->ch, (int)enc2out->isp_addr);
+		vbuf = k_fifo_get(&ctx->fifo_in, K_NO_WAIT);
+		if (vbuf == NULL) {
+			video_ispbuf_release(enc2out->ch, (int)enc2out->isp_addr);
+		} else {
+			/* NV12 raw frame: Y plane (w*h) + interleaved UV plane (w*h/2).
+			 * enc2out_t has no isp_len field, so derive the size from the
+			 * frame geometry (4:2:0 => width * height * 3 / 2).
+			 */
+			vbuf->size = enc2out->width * enc2out->height * 3 / 2;
+			vbuf->buffer = (uint8_t *)enc2out->isp_addr;
+			vbuf->timestamp = k_uptime_get_32();
+			k_fifo_put(&ctx->fifo_out, vbuf);
+		}
 	}
 }
 
@@ -230,6 +260,8 @@ static int video_amebapro2_set_fmt(const struct device *dev, struct video_format
 		data->params.type = VIDEO_HEVC;
 	} else if (fmt->pixelformat == VIDEO_PIX_FMT_JPEG) {
 		data->params.type = VIDEO_JPEG;
+	} else if (fmt->pixelformat == VIDEO_PIX_FMT_NV12) {
+		data->params.type = VIDEO_NV12;
 	}
 	data->params.width = fmt->width;
 	data->params.height = fmt->height;
@@ -450,6 +482,7 @@ static inline int video_amebapro2_set_ctrl(const struct device *dev, uint32_t id
 		ret = video_ctrl(data->params.stream_id, VIDEO_FORCE_IFRAME, ctrls->force_i.val);
 		ch_forcei[data->params.stream_id] = 1;
 		LOG_INF("VIDEO_CID_VENDOR_FORCE_IFRAME %x %d\r\n", ctrls->force_i.val, ret);
+		ctrls->force_i.val = 0; /* reset so next forcei isn't blocked by same-value check */
 		break;
 	case VIDEO_CID_VENDOR_BPS:
 		ret = video_ctrl(data->params.stream_id, VIDEO_BPS, ctrls->bps.val);
@@ -608,14 +641,19 @@ static int video_amebapro2_channel_init(const struct device *dev)
 	data->params.stream_id = config->stream_id;
 	data->params.bps = 1 * 1024 * 1024;
 	data->params.fps = config->default_fps;
-	data->params.type = VIDEO_HEVC;
+	data->params.type = config->default_video_type;
 	data->fmt.height = config->default_height;
 	data->fmt.width = config->default_width;
-	if (config->stream_id == 0x00) {
-		data->fmt.pixelformat = VIDEO_PIX_FMT_H265;
-	} else {
-		data->fmt.pixelformat = VIDEO_PIX_FMT_H264;
-	}
+
+	const uint32_t type_to_pixfmt[] = {
+		[VIDEO_HEVC] = VIDEO_PIX_FMT_H265,
+		[VIDEO_H264] = VIDEO_PIX_FMT_H264,
+		[VIDEO_JPEG] = VIDEO_PIX_FMT_JPEG,
+		[VIDEO_NV12] = VIDEO_PIX_FMT_NV12,
+	};
+	data->fmt.pixelformat = type_to_pixfmt[config->default_video_type];
+
+	data->params.out_mode = config->default_out_mode;
 
 	amebapro2_init_controls(dev);
 
@@ -631,6 +669,8 @@ static int video_amebapro2_channel_init(const struct device *dev)
 		.default_width = DT_INST_PROP_OR(inst, default_width, 1920),                       \
 		.default_height = DT_INST_PROP_OR(inst, default_height, 1080),                     \
 		.default_fps = DT_INST_PROP_OR(inst, default_fps, 30),                             \
+		.default_video_type = DT_INST_PROP_OR(inst, default_video_type, VIDEO_HEVC),       \
+		.default_out_mode = DT_INST_PROP_OR(inst, default_out_mode, 0),                    \
 		.label = DT_INST_PROP(inst, label),                                                \
 		.stream_id = inst,                                                                 \
 	};                                                                                         \
