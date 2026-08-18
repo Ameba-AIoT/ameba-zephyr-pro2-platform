@@ -22,6 +22,7 @@
 #include <eip_api.h>
 #include <md_api.h>
 #include <avcodec.h>
+#include <sensor.h>
 
 /* ===== EIP Motion Detection status ===== */
 #define EIP_MD_STOP  0
@@ -48,6 +49,29 @@ static const md_config_t eip_md_default_config = {
 #define VIDEO_CLOSE 0
 #define VIDEO_OPEN  1
 
+/* Per-channel default pixel format/resolution override for this sample:
+ * channel 0 -> JPEG @ 2592x1944, channel 1 -> H264 @ 1920x1080,
+ * channel 2 -> NV12 (unchanged, used for MD), logical channel 3 -> RGB24 @ 416x416
+ * (logical channel 3 is mapped to physical HAL channel 4 by devicetree)
+ */
+#define VIDEO_CH0_FORMAT VIDEO_PIX_FMT_JPEG
+#if USE_SENSOR == SENSOR_IMX775
+#define VIDEO_CH0_WIDTH  2592
+#define VIDEO_CH0_HEIGHT 1944
+#else
+#define VIDEO_CH0_WIDTH  1920
+#define VIDEO_CH0_HEIGHT 1080
+#endif
+#define VIDEO_CH0_FPS    15
+#define VIDEO_CH1_FORMAT VIDEO_PIX_FMT_H264
+#define VIDEO_CH1_WIDTH  1920
+#define VIDEO_CH1_HEIGHT 1080
+#define VIDEO_CH1_FPS    15
+#define VIDEO_CH3_FORMAT VIDEO_PIX_FMT_RGB24
+#define VIDEO_CH3_WIDTH  416
+#define VIDEO_CH3_HEIGHT 416
+#define VIDEO_CH3_FPS    5
+
 LOG_MODULE_REGISTER(video_capture, LOG_LEVEL_DBG);
 
 #define MOUNT_POINT      "/SD:"
@@ -55,7 +79,7 @@ LOG_MODULE_REGISTER(video_capture, LOG_LEVEL_DBG);
 
 #define STACKSIZE   16*1024
 #define PRIORITY    5
-#define NUM_THREADS 3
+#define NUM_THREADS 4
 
 #define VIDEO_BUF_SIZE (256 * 1024)
 
@@ -69,6 +93,7 @@ struct thread_context {
 	const char *name;
 	k_thread_stack_t *stack_ptr;
 	int video_status;
+	volatile int stop_requested;
 };
 
 #define EIP_COL 32
@@ -287,6 +312,68 @@ static void eip_process(struct eip_context *eip, int video_channel,
 	eip->motion_detect_ctx->count++;
 }
 
+static int video_requeue_flushed_buffers(const struct device *video)
+{
+	struct video_buffer *vbuf;
+	int ret;
+	int count = 0;
+
+	while (1) {
+		ret = video_dequeue(video, &vbuf, K_NO_WAIT);
+		if (ret == -EAGAIN) {
+			break;
+		}
+		if (ret) {
+			LOG_ERR("Unable to dequeue flushed buffer (%d)", ret);
+			return ret;
+		}
+
+		/*
+		 * video_stream_stop() calls video_flush(dev, true), so this
+		 * buffer has been canceled and no longer contains a valid frame.
+		 *
+		 * Clear size before video_enqueue() to prevent the driver from
+		 * releasing the same encoded frame for a second time.
+		 */
+		vbuf->size = 0;
+		vbuf->bytesused = 0;
+		vbuf->timestamp = 0;
+
+		ret = video_enqueue(video, vbuf);
+		if (ret) {
+			LOG_ERR("Unable to requeue flushed buffer (%d)", ret);
+			return ret;
+		}
+
+		count++;
+	}
+
+	LOG_DBG("Requeued %d flushed video buffers", count);
+
+	return 0;
+}
+
+static int video_stop_and_requeue(const struct device *video)
+{
+	int stop_ret;
+	int requeue_ret;
+
+	stop_ret = video_stream_stop(video, VIDEO_BUF_TYPE_OUTPUT);
+
+	/*
+	 * video_stream_stop() calls video_flush(video, true), even if
+	 * set_stream(false) reports an error. Always try to recover buffers.
+	 */
+	requeue_ret = video_requeue_flushed_buffers(video);
+
+	if (stop_ret) {
+		LOG_ERR("Unable to stop video stream (%d)", stop_ret);
+		return stop_ret;
+	}
+
+	return requeue_ret;
+}
+
 static void video_task(void *param, void *param1, void *param2)
 {
 	struct video_buffer buffers[16], *vbuf;
@@ -311,6 +398,8 @@ static void video_task(void *param, void *param1, void *param2)
 		goto EXIT;
 	}
 
+	video_channel = video_get_channel(ctx->name);
+
 	if (video_get_caps(video, &caps)) {
 		LOG_ERR("Unable to retrieve video capabilities");
 		goto EXIT;
@@ -333,9 +422,35 @@ static void video_task(void *param, void *param1, void *param2)
 		goto EXIT;
 	}
 
+	if (video_channel == 0) {
+		fmt.pixelformat = VIDEO_CH0_FORMAT;
+		fmt.width = VIDEO_CH0_WIDTH;
+		fmt.height = VIDEO_CH0_HEIGHT;
+	} else if (video_channel == 1) {
+		fmt.pixelformat = VIDEO_CH1_FORMAT;
+		fmt.width = VIDEO_CH1_WIDTH;
+		fmt.height = VIDEO_CH1_HEIGHT;
+	} else if (video_channel == 3) {
+		fmt.pixelformat = VIDEO_CH3_FORMAT;
+		fmt.width = VIDEO_CH3_WIDTH;
+		fmt.height = VIDEO_CH3_HEIGHT;
+	}
+
 	if (video_set_format(video, &fmt)) {
 		LOG_ERR("Unable to set video format");
 		goto EXIT;
+	}
+
+	if (video_channel == 0 || video_channel == 3) {
+		struct video_frmival frmival = {
+			.numerator = 1,
+			.denominator = video_channel == 0 ? VIDEO_CH0_FPS : VIDEO_CH3_FPS,
+		};
+
+		if (video_set_frmival(video, &frmival)) {
+			LOG_ERR("Unable to set video frame interval");
+			goto EXIT;
+		}
 	}
 
 	LOG_INF("- Default format: %c%c%c%c %ux%u\n", (char)fmt.pixelformat,
@@ -347,14 +462,13 @@ static void video_task(void *param, void *param1, void *param2)
 		video_enqueue(video, &buffers[i]);
 	}
 
-	video_channel = video_get_channel(ctx->name);
-
-	if (video_stream_start(video, VIDEO_BUF_TYPE_OUTPUT)) {
-		LOG_ERR("Unable to start capture (interface)");
-		goto EXIT;
+	if (video_channel != 0) {
+		if (video_stream_start(video, VIDEO_BUF_TYPE_OUTPUT)) {
+			LOG_ERR("Unable to start capture (interface)");
+			goto EXIT;
+		}
+		LOG_INF("Capture started\n");
 	}
-
-	LOG_INF("Capture started\n");
 
 	ctx->video_status = VIDEO_OPEN;
 
@@ -365,15 +479,51 @@ static void video_task(void *param, void *param1, void *param2)
 	while (1) {
 		int err;
 
-		err = video_dequeue(video, &vbuf, K_MSEC(500));
-		if (err) {
-			LOG_ERR("Unable to dequeue video buf");
-			goto EXIT;
+		if (ctx->stop_requested) {
+			LOG_INF("Stop requested for %s", video_dev_name);
+			break;
+		}
+
+		if (video_channel == 0) {
+			/* JPEG channel runs in one-shot MODE_SNAPSHOT (see
+			 * video_amebapro2_set_stream()): idle until a capture is
+			 * requested. Fully close/reopen the VOE channel around each
+			 * snapshot (instead of leaving it open and re-triggering) so
+			 * every capture starts from a clean state.
+			 */
+			if (!(ctxs.record_pending && ctxs.sdcard_init &&
+				  ctxs.video_record_channel == video_channel)) {
+				k_msleep(100);
+				continue;
+			}
+
+			if (video_stream_start(video, VIDEO_BUF_TYPE_OUTPUT)) {
+				LOG_ERR("Unable to start JPEG capture");
+				ctxs.record_pending = 0;
+				continue;
+			}
+			err = video_dequeue(video, &vbuf, K_MSEC(2000));
+			if (err) {
+				LOG_ERR("Snapshot capture timed out");
+				video_stream_stop(video, VIDEO_BUF_TYPE_OUTPUT);
+				ctxs.record_pending = 0;
+				continue;
+			}
+		} else {
+			err = video_dequeue(video, &vbuf, K_MSEC(500));
+			if (err) {
+				LOG_ERR("Unable to dequeue video buf");
+				goto EXIT;
+			}
 		}
 		frame++;
 		if (frame % 30 == 0) {
 			if (!ctxs.sdcard_init || (ctxs.video_record_channel != video_channel)) {
-				LOG_INF("\rGot frame %u! size: %u; timestamp %u ms", frame, vbuf->size, vbuf->timestamp);
+				LOG_INF("\rGot frame %u! ch%d [%c%c%c%c %ux%u] size: %u; timestamp %u ms",
+						frame, video_channel, (char)fmt.pixelformat,
+						(char)(fmt.pixelformat >> 8), (char)(fmt.pixelformat >> 16),
+						(char)(fmt.pixelformat >> 24), fmt.width, fmt.height, vbuf->size,
+						vbuf->timestamp);
 				mem_dump(vbuf->buffer, 16);
 			}
 		}
@@ -382,27 +532,35 @@ static void video_task(void *param, void *param1, void *param2)
 			eip_process(&ctxs.eip, video_channel, vbuf, &fmt);
 		}
 
-		/* Record trigger: NV12 single frame or H264/H265 multi-frame */
+		/* Record trigger: NV12/JPEG/RGB24 single frame or H264/H265 multi-frame */
 		if (ctxs.record_pending && ctxs.sdcard_init && ctxs.video_record_channel == video_channel) {
 
-			if (fmt.pixelformat == VIDEO_PIX_FMT_NV12) {
-				/* NV12: single frame snapshot */
+			if (fmt.pixelformat == VIDEO_PIX_FMT_NV12 ||
+				fmt.pixelformat == VIDEO_PIX_FMT_JPEG ||
+				fmt.pixelformat == VIDEO_PIX_FMT_RGB24) {
+				/* NV12/JPEG/RGB24: single frame snapshot */
+				const char *ext = (fmt.pixelformat == VIDEO_PIX_FMT_NV12) ? "nv12" :
+								  (fmt.pixelformat == VIDEO_PIX_FMT_JPEG) ? "jpg" : "rgb";
 				char snap_filename[32];
 				struct fs_file_t snap_file;
 
-				fs_file_t_init(&snap_file);
-				snprintf(snap_filename, sizeof(snap_filename), "/SD:/snap_%d.nv12", ctxs.record_seq);
-				if (fs_open(&snap_file, snap_filename, FS_O_CREATE | FS_O_WRITE) == 0) {
-					fs_write(&snap_file, vbuf->buffer, vbuf->size);
-					fs_close(&snap_file);
-					LOG_INF("Snapshot saved: %s (%u bytes)", snap_filename, vbuf->size);
-					ctxs.record_seq++;
+				if (vbuf->size == 0) {
+					LOG_ERR("Empty capture (0 bytes), discarding");
 				} else {
-					LOG_ERR("Failed to open snapshot file");
+					fs_file_t_init(&snap_file);
+					snprintf(snap_filename, sizeof(snap_filename), "/SD:/snap_%d.%s", ctxs.record_seq, ext);
+					if (fs_open(&snap_file, snap_filename, FS_O_CREATE | FS_O_WRITE) == 0) {
+						fs_write(&snap_file, vbuf->buffer, vbuf->size);
+						fs_close(&snap_file);
+						LOG_INF("Snapshot saved: %s (%u bytes)", snap_filename, vbuf->size);
+						ctxs.record_seq++;
+					} else {
+						LOG_ERR("Failed to open snapshot file");
+					}
 				}
 				ctxs.record_pending = 0;
 
-				/* Deinit SD after NV12 snapshot */
+				/* Deinit SD after snapshot */
 				fs_unmount(&ctxs.fat_mount);
 				disk_access_ioctl(ctxs.fat_mount.storage_dev, DISK_IOCTL_CTRL_DEINIT, NULL);
 				ctxs.sdcard_init = 0;
@@ -425,6 +583,13 @@ static void video_task(void *param, void *param1, void *param2)
 				} else {
 					LOG_ERR("Failed to open recording file");
 					ctxs.record_pending = 0;
+
+					/* Deinit SD: no recording was started, so nothing
+					 * will unmount it later.
+					 */
+					fs_unmount(&ctxs.fat_mount);
+					disk_access_ioctl(ctxs.fat_mount.storage_dev, DISK_IOCTL_CTRL_DEINIT, NULL);
+					ctxs.sdcard_init = 0;
 				}
 			}
 		}
@@ -456,8 +621,15 @@ static void video_task(void *param, void *param1, void *param2)
 			LOG_ERR("Unable to requeue video buf");
 			goto EXIT;
 		}
+
+		if (video_channel == 0) {
+			video_stop_and_requeue(video);
+		}
 	}
 EXIT:
+	if (video != NULL && video_channel != 0 && ctx->video_status == VIDEO_OPEN) {
+		video_stop_and_requeue(video);
+	}
 	if (recording) {
 		video_sd_flush_buf(&record_file);
 		fs_close(&record_file);
@@ -477,8 +649,11 @@ static void video_thread_init(const char *video_dev_name)
 		video_index = 1;
 	} else if (strcasecmp(video_dev_name, "video_2") == 0) {
 		video_index = 2;
+	} else if (strcasecmp(video_dev_name, "video_3") == 0) {
+		video_index = 3;
 	}
 
+	ctxs.vthread[video_index].stop_requested = 0;
 	ctxs.vthread[video_index].tid = k_thread_create(
 										&ctxs.vthread[video_index].thread_data, thread_stacks[video_index], STACKSIZE,
 										video_task, &ctxs.vthread[video_index], NULL, NULL, PRIORITY, 0, K_NO_WAIT);
@@ -486,11 +661,11 @@ static void video_thread_init(const char *video_dev_name)
 
 int main(void)
 {
-	static const char *const video_names[NUM_THREADS] = {"video_0", "video_1", "video_2"};
+	static const char *const video_names[NUM_THREADS] = {"video_0", "video_1", "video_2", "video_3"};
 
 	LOG_INF("amebapro2 video example\r\n");
-	LOG_INF("Enter the video start video_0/video_1/video_2 to run the video\r\n");
-	LOG_INF("Enter the video stop video_0/video_1/video_2 to stop the video\r\n");
+	LOG_INF("Enter the video start video_0/video_1/video_2/video_3 to run the video\r\n");
+	LOG_INF("Enter the video stop video_0/video_1/video_2/video_3 to stop the video\r\n");
 
 	for (int i = 0; i < NUM_THREADS; i++) {
 		ctxs.vthread[i].name = video_names[i];
@@ -501,7 +676,8 @@ int main(void)
 
 static bool is_valid_video_device(const char *dev_name)
 {
-	return (strcmp(dev_name, "video_0") == 0) || (strcmp(dev_name, "video_1") == 0) || (strcmp(dev_name, "video_2") == 0);
+	return (strcmp(dev_name, "video_0") == 0) || (strcmp(dev_name, "video_1") == 0) ||
+		   (strcmp(dev_name, "video_2") == 0) || (strcmp(dev_name, "video_3") == 0);
 }
 
 static int cmd_video_start(const struct shell *shell, size_t argc, char **argv)
@@ -511,13 +687,13 @@ static int cmd_video_start(const struct shell *shell, size_t argc, char **argv)
 
 	if (argc != 2) {
 		shell_print(shell, "Usage: video start <device_name>, device name should be "
-					"video_0, video_1 or video_2");
+					"video_0, video_1, video_2 or video_3");
 		return -EINVAL;
 	}
 	LOG_INF("dev_name %s", dev_name);
 
 	if (!is_valid_video_device(dev_name)) {
-		shell_error(shell, "Invalid device name '%s'. Allowed: video_0, video_1, video_2", dev_name);
+		shell_error(shell, "Invalid device name '%s'. Allowed: video_0, video_1, video_2, video_3", dev_name);
 		return -EINVAL;
 	}
 
@@ -539,14 +715,14 @@ static int cmd_video_stop(const struct shell *shell, size_t argc, char **argv)
 	int video_index = 0;
 
 	if (argc != 2) {
-		shell_print(shell, "Usage: video stop <device_name> video_0~video_2");
+		shell_print(shell, "Usage: video stop <device_name> video_0~video_3");
 		return -EINVAL;
 	}
 
 	dev_name = argv[1];
 
 	if (!is_valid_video_device(dev_name)) {
-		shell_error(shell, "Invalid device name '%s'. Allowed: video_0, video_1, video_2", dev_name);
+		shell_error(shell, "Invalid device name '%s'. Allowed: video_0, video_1, video_2, video_3", dev_name);
 		return -EINVAL;
 	}
 
@@ -562,8 +738,13 @@ static int cmd_video_stop(const struct shell *shell, size_t argc, char **argv)
 	}
 
 	if (ctxs.vthread[video_index].video_status == VIDEO_OPEN) {
-		video_stream_stop(video, VIDEO_BUF_TYPE_OUTPUT);
-		shell_print(shell, "Video stopped");
+		/* Only the owning video_task thread may call video_stream_stop():
+		 * it is the one holding the queued/dequeued buffers. Stopping the
+		 * stream from here would race with the thread's own dequeue/EXIT
+		 * path and close the HAL channel twice.
+		 */
+		ctxs.vthread[video_index].stop_requested = 1;
+		shell_print(shell, "Video stop requested");
 	} else {
 		shell_print(shell, "Video is close status\r\n");
 	}
@@ -581,7 +762,7 @@ static int cmd_video_ctrl(const struct shell *shell, size_t argc, char **argv)
 	struct video_control control;
 
 	if (argc != 4) {
-		shell_error(shell, "Usage: video cmd <operation> <value> video_0/video_1/video_2");
+		shell_error(shell, "Usage: video cmd <operation> <value> video_0/video_1/video_2/video_3");
 		return -EINVAL;
 	}
 
@@ -590,7 +771,7 @@ static int cmd_video_ctrl(const struct shell *shell, size_t argc, char **argv)
 	dev_name = argv[3];
 
 	if (!is_valid_video_device(dev_name)) {
-		shell_error(shell, "Invalid device name '%s'. Allowed: video_0, video_1, video_2", dev_name);
+		shell_error(shell, "Invalid device name '%s'. Allowed: video_0, video_1, video_2, video_3", dev_name);
 		return -EINVAL;
 	}
 
@@ -647,17 +828,39 @@ static int cmd_video_ctrl(const struct shell *shell, size_t argc, char **argv)
 
 static int cmd_video_record_init(const struct shell *shell, size_t argc, char **argv)
 {
+	uint32_t target_channel = ctxs.video_record_channel;
+
 	if (argc == 2) {
 		const char *dev_name = argv[1];
 
 		if (!is_valid_video_device(dev_name)) {
-			shell_error(shell, "Invalid device name '%s'. Allowed: video_0, video_1, video_2",
+			shell_error(shell, "Invalid device name '%s'. Allowed: video_0, video_1, video_2, video_3",
 						dev_name);
 			return -EINVAL;
 		}
-		ctxs.video_record_channel = video_get_channel(dev_name);
+		target_channel = video_get_channel(dev_name);
 	}
 
+	if (ctxs.vthread[target_channel].video_status != VIDEO_OPEN) {
+		shell_error(shell, "video_%u is not running. Start it first with 'video start video_%u'",
+					target_channel, target_channel);
+		return -EINVAL;
+	}
+
+	/*
+	 * Only one channel may record at a time: the SD card stays mounted
+	 * (sdcard_init) for the whole duration of a pending or in-progress
+	 * recording/snapshot, so checking it alone also rejects a re-trigger
+	 * on the same channel while it is still recording.
+	 */
+	if (ctxs.record_pending || ctxs.sdcard_init) {
+		shell_error(shell, "video_%u is already recording/pending, only one channel can "
+					"record at a time",
+					ctxs.video_record_channel);
+		return -EBUSY;
+	}
+
+	ctxs.video_record_channel = target_channel;
 	video_sd_card_init();
 	shell_print(shell, "Enable the sdcard, record channel video_%u", ctxs.video_record_channel);
 	ctxs.record_pending = 1;
@@ -679,7 +882,7 @@ static int cmd_video_md(const struct shell *shell, size_t argc, char **argv)
 	dev_name = argv[argc - 1];
 
 	if (!is_valid_video_device(dev_name)) {
-		shell_error(shell, "Invalid device name '%s'. Allowed: video_0, video_1, video_2", dev_name);
+		shell_error(shell, "Invalid device name '%s'. Allowed: video_0, video_1, video_2, video_3", dev_name);
 		return -EINVAL;
 	}
 
@@ -754,7 +957,7 @@ static int cmd_video_md(const struct shell *shell, size_t argc, char **argv)
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_video, SHELL_CMD(start, NULL, "Start video", cmd_video_start),
 							   SHELL_CMD(stop, NULL, "Stop video", cmd_video_stop),
 							   SHELL_CMD(cmd, NULL, "Video cmd", cmd_video_ctrl),
-							   SHELL_CMD(record, NULL, "Record video [video_0|video_1|video_2]", cmd_video_record_init),
+							   SHELL_CMD(record, NULL, "Record video [video_0|video_1|video_2|video_3]", cmd_video_record_init),
 							   SHELL_CMD(md, NULL, "Motion detection (video_2 only) <start|stop|sensitivity|ae_stable|status>", cmd_video_md),
 							   SHELL_SUBCMD_SET_END);
 

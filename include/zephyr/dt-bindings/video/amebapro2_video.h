@@ -12,6 +12,7 @@
 #define AMEBAPRO2_VIDEO_TYPE_H264  1
 #define AMEBAPRO2_VIDEO_TYPE_JPEG  2
 #define AMEBAPRO2_VIDEO_TYPE_NV12  3
+#define AMEBAPRO2_VIDEO_TYPE_RGB   4
 
 /* VOE output mode values for default-out-mode DTS property */
 #define AMEBAPRO2_VIDEO_OUT_MODE_DEFAULT    0

@@ -22,6 +22,7 @@ BUILD_ASSERT(AMEBAPRO2_VIDEO_TYPE_HEVC == VIDEO_HEVC, "HEVC type mismatch");
 BUILD_ASSERT(AMEBAPRO2_VIDEO_TYPE_H264 == VIDEO_H264, "H264 type mismatch");
 BUILD_ASSERT(AMEBAPRO2_VIDEO_TYPE_JPEG == VIDEO_JPEG, "JPEG type mismatch");
 BUILD_ASSERT(AMEBAPRO2_VIDEO_TYPE_NV12 == VIDEO_NV12, "NV12 type mismatch");
+BUILD_ASSERT(AMEBAPRO2_VIDEO_TYPE_RGB  == VIDEO_RGB,  "RGB type mismatch");
 
 #include "video_ctrls.h"
 #include "video_device.h"
@@ -88,6 +89,15 @@ static const struct video_format_cap fmts[] = {
 	{
 		.pixelformat = VIDEO_PIX_FMT_JPEG,
 		.width_min = 64,
+		.width_max = 2592,
+		.height_min = 64,
+		.height_max = 1944,
+		.width_step = 16,
+		.height_step = 16,
+	},
+	{
+		.pixelformat = VIDEO_PIX_FMT_NV12,
+		.width_min = 64,
 		.width_max = 1920,
 		.height_min = 64,
 		.height_max = 1080,
@@ -95,7 +105,7 @@ static const struct video_format_cap fmts[] = {
 		.height_step = 16,
 	},
 	{
-		.pixelformat = VIDEO_PIX_FMT_NV12,
+		.pixelformat = VIDEO_PIX_FMT_RGB24,
 		.width_min = 64,
 		.width_max = 1920,
 		.height_min = 64,
@@ -225,11 +235,17 @@ static void video_output_cb(void *param1, void *param2, uint32_t arg)
 		if (vbuf == NULL) {
 			video_ispbuf_release(enc2out->ch, (int)enc2out->isp_addr);
 		} else {
-			/* NV12 raw frame: Y plane (w*h) + interleaved UV plane (w*h/2).
-			 * enc2out_t has no isp_len field, so derive the size from the
-			 * frame geometry (4:2:0 => width * height * 3 / 2).
-			 */
-			vbuf->size = enc2out->width * enc2out->height * 3 / 2;
+			if (enc2out->codec == CODEC_NV12) {
+				/* NV12 raw frame: Y plane (w*h) + interleaved UV plane (w*h/2).
+				* enc2out_t has no isp_len field, so derive the size from the
+				* frame geometry (4:2:0 => width * height * 3 / 2).
+				*/
+				vbuf->size = enc2out->width * enc2out->height * 3 / 2;
+			} else if (enc2out->codec == CODEC_RGB) {
+				vbuf->size = enc2out->width * enc2out->height * 3;
+			} else if (enc2out->codec == CODEC_NV16) {
+				vbuf->size = enc2out->width * enc2out->height * 2;
+			}
 			vbuf->buffer = (uint8_t *)enc2out->isp_addr;
 			vbuf->timestamp = k_uptime_get_32();
 			k_fifo_put(&ctx->fifo_out, vbuf);
@@ -262,6 +278,8 @@ static int video_amebapro2_set_fmt(const struct device *dev, struct video_format
 		data->params.type = VIDEO_JPEG;
 	} else if (fmt->pixelformat == VIDEO_PIX_FMT_NV12) {
 		data->params.type = VIDEO_NV12;
+	} else if (fmt->pixelformat == VIDEO_PIX_FMT_RGB24) {
+		data->params.type = VIDEO_RGB;
 	}
 	data->params.width = fmt->width;
 	data->params.height = fmt->height;
@@ -289,7 +307,14 @@ static int video_amebapro2_set_stream(const struct device *dev, bool enable,
 	if (enable) {
 		ret = video_open(&data->params, video_output_cb, (void *)dev);
 		if (data->params.type == VIDEO_JPEG) {
-			video_ctrl(data->params.stream_id, VIDEO_JPEG_OUTPUT, 2);
+			/* Pure JPEG channel: buffer is sized for a single frame (no ring,
+			 * see jpeg_out_rsvd_size in video_api.c), so it must run in
+			 * one-shot MODE_SNAPSHOT (1), not continuous MODE_ENABLE (2),
+			 * otherwise the VOE keeps re-encoding into the same slot and
+			 * overflows the buffer. Each capture must be triggered explicitly
+			 * (VIDEO_CID_VENDOR_SNAPSHOT), one photo per trigger.
+			 */
+			video_ctrl(data->params.stream_id, VIDEO_JPEG_OUTPUT, 1);
 		}
 	} else {
 		ret = video_close(data->params.stream_id);
@@ -650,6 +675,7 @@ static int video_amebapro2_channel_init(const struct device *dev)
 		[VIDEO_H264] = VIDEO_PIX_FMT_H264,
 		[VIDEO_JPEG] = VIDEO_PIX_FMT_JPEG,
 		[VIDEO_NV12] = VIDEO_PIX_FMT_NV12,
+		[VIDEO_RGB] = VIDEO_PIX_FMT_RGB24,
 	};
 	data->fmt.pixelformat = type_to_pixfmt[config->default_video_type];
 
@@ -672,7 +698,7 @@ static int video_amebapro2_channel_init(const struct device *dev)
 		.default_video_type = DT_INST_PROP_OR(inst, default_video_type, VIDEO_HEVC),       \
 		.default_out_mode = DT_INST_PROP_OR(inst, default_out_mode, 0),                    \
 		.label = DT_INST_PROP(inst, label),                                                \
-		.stream_id = inst,                                                                 \
+		.stream_id = DT_INST_REG_ADDR(inst),                                                   \
 	};                                                                                         \
                                                                                                    \
 	DEVICE_DT_INST_DEFINE(inst, video_amebapro2_channel_init, NULL, &video_data_##inst,        \

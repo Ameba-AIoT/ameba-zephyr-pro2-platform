@@ -34,7 +34,7 @@ properties:
     description: >
       Default encode type. Use constants from
       dt-bindings/video/amebapro2_video.h:
-      AMEBAPRO2_VIDEO_TYPE_HEVC, _H264, _JPEG, _NV12.
+      AMEBAPRO2_VIDEO_TYPE_HEVC, _H264, _JPEG, _NV12, _RGB.
 
   default-out-mode:
     type: int

@@ -115,8 +115,15 @@
 	status = "disabled";
 };
 
+/* Logical video_3 uses physical CH4 because RGB output is only supported on CH4. */
 &video_channel4 {
-	status = "disabled";
+	status = "okay";
+	label = "video_3";
+	default-video-type = <AMEBAPRO2_VIDEO_TYPE_RGB>;
+	default-width = <416>;
+	default-height = <416>;
+	default-fps = <5>;
+	default-out-mode = <AMEBAPRO2_VIDEO_OUT_MODE_CONTINUOUS>;
 };
 
 &sdmmc {
