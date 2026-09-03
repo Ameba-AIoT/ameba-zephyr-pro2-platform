@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "model_flash_loader.h"
+#include <zephyr/drivers/misc/ameba_npu_model_loader.h>
 
 #include <errno.h>
 #include <stdint.h>
@@ -14,7 +14,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
 
-LOG_MODULE_DECLARE(npu_sample, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(npu_model_loader, LOG_LEVEL_INF);
 
 #define NPU_FLASH_BASE 0x08000000UL
 #define NPU_FLASH_PARTITION_TABLE_OFFSET 0x2000UL

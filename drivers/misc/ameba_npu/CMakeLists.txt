@@ -1,3 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 zephyr_library_sources_ifdef(CONFIG_NPU_AMEBAPRO2 ameba_npu.c)
+zephyr_library_sources_ifdef(CONFIG_AMEBA_NPU_MODEL_FLASH_LOADER ameba_npu_model_loader.c)
+zephyr_library_sources_ifdef(CONFIG_AMEBA_NPU_YOLOV4_TINY_POSTPROCESS ameba_npu_yolov4_tiny_postprocess.c)
+zephyr_library_sources_ifdef(CONFIG_AMEBA_NPU_SCRFD_POSTPROCESS ameba_npu_scrfd_postprocess.c)

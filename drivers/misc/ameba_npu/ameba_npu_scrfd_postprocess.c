@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "scrfd_postprocess.h"
+#include <zephyr/drivers/misc/ameba_npu_scrfd_postprocess.h>
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -14,7 +15,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
 
-LOG_MODULE_DECLARE(npu_sample, LOG_LEVEL_INF);
+LOG_MODULE_REGISTER(scrfd_postprocess, LOG_LEVEL_INF);
 
 #define SCRFD_INPUT_WIDTH 576U
 #define SCRFD_INPUT_HEIGHT 320U

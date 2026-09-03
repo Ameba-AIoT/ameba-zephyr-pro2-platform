@@ -4,10 +4,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
+#include <zephyr/drivers/misc/ameba_npu.h>
 #include <zephyr/drivers/video.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/logging/log.h>
@@ -23,6 +28,9 @@
 #include <md_api.h>
 #include <avcodec.h>
 #include <sensor.h>
+
+#include <zephyr/drivers/misc/ameba_npu_model_loader.h>
+#include <zephyr/drivers/misc/ameba_npu_yolov4_tiny_postprocess.h>
 
 /* ===== EIP Motion Detection status ===== */
 #define EIP_MD_STOP  0
@@ -48,6 +56,7 @@ static const md_config_t eip_md_default_config = {
 
 #define VIDEO_CLOSE 0
 #define VIDEO_OPEN  1
+#define VIDEO_STARTING 2
 
 /* Per-channel default pixel format/resolution override for this sample:
  * channel 0 -> JPEG @ 2592x1944, channel 1 -> H264 @ 1920x1080,
@@ -66,11 +75,17 @@ static const md_config_t eip_md_default_config = {
 #define VIDEO_CH1_FORMAT VIDEO_PIX_FMT_H264
 #define VIDEO_CH1_WIDTH  1920
 #define VIDEO_CH1_HEIGHT 1080
-#define VIDEO_CH1_FPS    15
+#define VIDEO_CH1_FPS    30
 #define VIDEO_CH3_FORMAT VIDEO_PIX_FMT_RGB24
 #define VIDEO_CH3_WIDTH  416
 #define VIDEO_CH3_HEIGHT 416
 #define VIDEO_CH3_FPS    5
+
+/* video_3 is the dedicated live RGB888-planar channel for YOLOv4-tiny. */
+#define VIDEO_NN_CHANNEL        3
+#define VIDEO_NN_MODEL_FILENAME "yolov4_tiny.nb"
+#define VIDEO_NN_INPUT_SIZE     \
+	((size_t)YOLOV4_TINY_INPUT_WIDTH * YOLOV4_TINY_INPUT_HEIGHT * 3U)
 
 LOG_MODULE_REGISTER(video_capture, LOG_LEVEL_DBG);
 
@@ -112,9 +127,36 @@ struct eip_context {
 	volatile int md_status;                /* EIP_MD_STOP / START / SET_STOP */
 };
 
+enum video_nn_status {
+	VIDEO_NN_STOPPED,
+	VIDEO_NN_START_REQUESTED,
+	VIDEO_NN_STARTING,
+	VIDEO_NN_RUNNING,
+	VIDEO_NN_STOP_REQUESTED,
+	VIDEO_NN_ERROR,
+};
+
+/*
+ * The video_3 thread owns every NPU/model resource.  Shell commands only
+ * update status, so model load/unload can never race with frame inference.
+ */
+struct video_nn_context {
+	struct ameba_npu model;
+	struct npu_flash_model flash_model;
+	struct ameba_npu_buffer_param output_params[YOLOV4_TINY_OUTPUT_COUNT];
+	size_t output_sizes[YOLOV4_TINY_OUTPUT_COUNT];
+	volatile enum video_nn_status status;
+	bool npu_initialized;
+	bool model_loaded;
+	uint32_t inference_count;
+	uint32_t error_count;
+	int last_error;
+};
+
 struct video_sample_context {
 	struct thread_context vthread[NUM_THREADS];
 	struct eip_context eip;
+	struct video_nn_context nn;
 	FATFS fat_fs;
 	int sdcard_init;
 	struct fs_file_t file;
@@ -312,6 +354,263 @@ static void eip_process(struct eip_context *eip, int video_channel,
 	eip->motion_detect_ctx->count++;
 }
 
+static const char *video_nn_status_name(enum video_nn_status status)
+{
+	switch (status) {
+	case VIDEO_NN_STOPPED:
+		return "STOPPED";
+	case VIDEO_NN_START_REQUESTED:
+		return "START_REQUESTED";
+	case VIDEO_NN_STARTING:
+		return "STARTING";
+	case VIDEO_NN_RUNNING:
+		return "RUNNING";
+	case VIDEO_NN_STOP_REQUESTED:
+		return "STOP_REQUESTED";
+	case VIDEO_NN_ERROR:
+		return "ERROR";
+	default:
+		return "UNKNOWN";
+	}
+}
+
+static int video_nn_release(struct video_nn_context *nn)
+{
+	int ret = 0;
+	int cleanup_ret;
+
+	if (nn->model_loaded) {
+		cleanup_ret = ameba_npu_unload(&nn->model);
+		if (cleanup_ret != 0) {
+			LOG_ERR("Failed to unload YOLO model: %d", cleanup_ret);
+			ret = cleanup_ret;
+		}
+		nn->model_loaded = false;
+	}
+
+	npu_flash_model_unload(&nn->flash_model);
+
+	if (nn->npu_initialized) {
+		cleanup_ret = ameba_npu_deinit();
+		if (cleanup_ret != 0) {
+			LOG_ERR("Failed to deinitialize NPU: %d", cleanup_ret);
+			if (ret == 0) {
+				ret = cleanup_ret;
+			}
+		}
+		nn->npu_initialized = false;
+	}
+
+	memset(nn->output_params, 0, sizeof(nn->output_params));
+	memset(nn->output_sizes, 0, sizeof(nn->output_sizes));
+	return ret;
+}
+
+static int video_nn_initialize(struct video_nn_context *nn)
+{
+	int ret;
+
+	LOG_INF("Initializing live YOLOv4-tiny on video_%d", VIDEO_NN_CHANNEL);
+	LOG_INF("NPU runtime version: 0x%08x", ameba_npu_get_version());
+
+	ret = ameba_npu_init();
+	if (ret != 0) {
+		LOG_ERR("Failed to initialize NPU: %d", ret);
+		return ret;
+	}
+	nn->npu_initialized = true;
+
+	ret = npu_flash_model_load(VIDEO_NN_MODEL_FILENAME, &nn->flash_model);
+	if (ret != 0) {
+		LOG_ERR("Failed to load %s from NN_MDL flash: %d",
+				VIDEO_NN_MODEL_FILENAME, ret);
+		return ret;
+	}
+
+	ret = ameba_npu_load(&nn->model, nn->flash_model.data,
+						 nn->flash_model.size);
+	if (ret != 0) {
+		LOG_ERR("Failed to load YOLO NPU model: %d", ret);
+		return ret;
+	}
+	nn->model_loaded = true;
+
+	if (ameba_npu_get_input_count(&nn->model) != 1U) {
+		LOG_ERR("YOLO model must expose one input, got %u",
+				ameba_npu_get_input_count(&nn->model));
+		return -EINVAL;
+	}
+
+	if (ameba_npu_get_input_size(&nn->model, 0) != VIDEO_NN_INPUT_SIZE) {
+		LOG_ERR("YOLO input size mismatch: model=%u video=%u",
+				(uint32_t)ameba_npu_get_input_size(&nn->model, 0),
+				(uint32_t)VIDEO_NN_INPUT_SIZE);
+		return -EINVAL;
+	}
+
+	if (ameba_npu_get_output_count(&nn->model) != YOLOV4_TINY_OUTPUT_COUNT) {
+		LOG_ERR("YOLO model must expose %u outputs, got %u",
+				YOLOV4_TINY_OUTPUT_COUNT,
+				ameba_npu_get_output_count(&nn->model));
+		return -EINVAL;
+	}
+
+	for (uint32_t i = 0; i < YOLOV4_TINY_OUTPUT_COUNT; i++) {
+		ret = ameba_npu_get_output_param(&nn->model, i,
+										 &nn->output_params[i]);
+		if (ret != 0) {
+			LOG_ERR("Failed to query YOLO output[%u]: %d", i, ret);
+			return ret;
+		}
+
+		nn->output_sizes[i] = ameba_npu_get_output_size(&nn->model, i);
+		LOG_INF("YOLO output[%u]: dims=%ux%ux%u format=%d quant=%d size=%u",
+				i, nn->output_params[i].dim_size[0],
+				nn->output_params[i].dim_size[1],
+				nn->output_params[i].dim_size[2],
+				nn->output_params[i].data_format,
+				nn->output_params[i].quant_format,
+				(uint32_t)nn->output_sizes[i]);
+	}
+
+	nn->inference_count = 0U;
+	nn->error_count = 0U;
+	nn->last_error = 0;
+	return 0;
+}
+
+static int video_nn_postprocess(struct video_nn_context *nn)
+{
+	struct yolov4_tiny_tensor tensors[YOLOV4_TINY_OUTPUT_COUNT] = {0};
+	uint32_t mapped_count = 0U;
+	int ret = 0;
+	int cleanup_ret;
+
+	for (uint32_t i = 0; i < YOLOV4_TINY_OUTPUT_COUNT; i++) {
+		tensors[i].param = nn->output_params[i];
+		tensors[i].size = nn->output_sizes[i];
+		tensors[i].data = ameba_npu_map_output(&nn->model, i);
+		if (tensors[i].data == NULL) {
+			LOG_ERR("Failed to map YOLO output[%u]", i);
+			ret = -EIO;
+			goto out_unmap;
+		}
+		mapped_count++;
+	}
+
+	ret = yolov4_tiny_postprocess_and_log(tensors,
+										  YOLOV4_TINY_OUTPUT_COUNT);
+
+out_unmap:
+	for (uint32_t i = 0; i < mapped_count; i++) {
+		cleanup_ret = ameba_npu_unmap_output(&nn->model, i);
+		if (cleanup_ret != 0) {
+			LOG_ERR("Failed to unmap YOLO output[%u]: %d", i, cleanup_ret);
+			if (ret == 0) {
+				ret = cleanup_ret;
+			}
+		}
+	}
+
+	return ret;
+}
+
+static int video_nn_process(struct video_nn_context *nn,
+							struct video_buffer *vbuf,
+							const struct video_format *fmt)
+{
+	struct ameba_npu_inference_profile profile;
+	int ret;
+
+	if (nn->status != VIDEO_NN_RUNNING) {
+		return 0;
+	}
+
+	if (fmt->pixelformat != VIDEO_PIX_FMT_RGB24 ||
+		fmt->width != YOLOV4_TINY_INPUT_WIDTH ||
+		fmt->height != YOLOV4_TINY_INPUT_HEIGHT ||
+		vbuf->buffer == NULL || vbuf->size != VIDEO_NN_INPUT_SIZE) {
+		LOG_ERR("Invalid YOLO video frame: format=0x%08x %ux%u addr=%p size=%u",
+				fmt->pixelformat, fmt->width, fmt->height, vbuf->buffer,
+				vbuf->size);
+		ret = -EINVAL;
+		goto out_error;
+	}
+
+	/*
+	 * VIDEO_RGB is already 416x416 RGB888 planar (RRR...GGG...BBB...),
+	 * matching the model input.  ameba_npu_set_input() copies the frame
+	 * before video_enqueue() releases the ISP buffer, so no resize or
+	 * intermediate frame buffer is needed.
+	 */
+	ret = ameba_npu_set_input(&nn->model, 0, vbuf->buffer,
+							  VIDEO_NN_INPUT_SIZE);
+	if (ret != 0) {
+		LOG_ERR("Failed to set live YOLO input: %d", ret);
+		goto out_error;
+	}
+
+	ret = ameba_npu_inference(&nn->model, &profile);
+	if (ret != 0) {
+		LOG_ERR("Live YOLO inference failed: %d", ret);
+		goto out_error;
+	}
+
+	nn->inference_count++;
+	LOG_INF("YOLO frame %u: inference=%u us total_cycle=%u",
+			nn->inference_count, profile.inference_time, profile.total_cycle);
+
+	ret = video_nn_postprocess(nn);
+	if (ret != 0) {
+		LOG_ERR("Live YOLO postprocess failed: %d", ret);
+		goto out_error;
+	}
+
+	nn->last_error = 0;
+	return 0;
+
+out_error:
+	nn->error_count++;
+	nn->last_error = ret;
+	return ret;
+}
+
+static void video_nn_service_requests(struct video_nn_context *nn)
+{
+	int ret;
+
+	if (nn->status == VIDEO_NN_START_REQUESTED) {
+		nn->status = VIDEO_NN_STARTING;
+		ret = video_nn_initialize(nn);
+		if (ret != 0) {
+			video_nn_release(nn);
+			nn->error_count++;
+			nn->last_error = ret;
+			nn->status = (nn->status == VIDEO_NN_STOP_REQUESTED) ?
+						 VIDEO_NN_STOPPED : VIDEO_NN_ERROR;
+			return;
+		}
+
+		if (nn->status == VIDEO_NN_STOP_REQUESTED) {
+			ret = video_nn_release(nn);
+			nn->last_error = ret;
+			nn->status = (ret == 0) ? VIDEO_NN_STOPPED : VIDEO_NN_ERROR;
+			return;
+		}
+
+		nn->status = VIDEO_NN_RUNNING;
+		LOG_INF("Live YOLOv4-tiny started on video_%d", VIDEO_NN_CHANNEL);
+	}
+
+	if (nn->status == VIDEO_NN_STOP_REQUESTED) {
+		ret = video_nn_release(nn);
+		nn->last_error = ret;
+		nn->status = (ret == 0) ? VIDEO_NN_STOPPED : VIDEO_NN_ERROR;
+		LOG_INF("Live YOLOv4-tiny stopped; video_%d remains open",
+				VIDEO_NN_CHANNEL);
+	}
+}
+
 static int video_requeue_flushed_buffers(const struct device *video)
 {
 	struct video_buffer *vbuf;
@@ -392,13 +691,17 @@ static void video_task(void *param, void *param1, void *param2)
 	int recording = 0;
 	int record_count = 0;
 
+	video_channel = video_get_channel(ctx->name);
+	if (video_channel < 0 || video_channel >= NUM_THREADS) {
+		LOG_ERR("Invalid video channel for %s", video_dev_name);
+		goto EXIT;
+	}
+
 	video = device_get_binding(video_dev_name);
 	if (video == NULL) {
 		LOG_ERR("Video device %s not found", video_dev_name);
 		goto EXIT;
 	}
-
-	video_channel = video_get_channel(ctx->name);
 
 	if (video_get_caps(video, &caps)) {
 		LOG_ERR("Unable to retrieve video capabilities");
@@ -484,6 +787,10 @@ static void video_task(void *param, void *param1, void *param2)
 			break;
 		}
 
+		if (video_channel == VIDEO_NN_CHANNEL) {
+			video_nn_service_requests(&ctxs.nn);
+		}
+
 		if (video_channel == 0) {
 			/* JPEG channel runs in one-shot MODE_SNAPSHOT (see
 			 * video_amebapro2_set_stream()): idle until a capture is
@@ -530,6 +837,11 @@ static void video_task(void *param, void *param1, void *param2)
 
 		if (video_channel == 2) {
 			eip_process(&ctxs.eip, video_channel, vbuf, &fmt);
+		}
+
+		if (video_channel == VIDEO_NN_CHANNEL) {
+			/* Keep the ISP buffer dequeued until NPU input copy completes. */
+			(void)video_nn_process(&ctxs.nn, vbuf, &fmt);
 		}
 
 		/* Record trigger: NV12/JPEG/RGB24 single frame or H264/H265 multi-frame */
@@ -630,6 +942,14 @@ EXIT:
 	if (video != NULL && video_channel != 0 && ctx->video_status == VIDEO_OPEN) {
 		video_stop_and_requeue(video);
 	}
+	if (video_channel == VIDEO_NN_CHANNEL) {
+		int nn_ret = video_nn_release(&ctxs.nn);
+
+		if (nn_ret != 0) {
+			ctxs.nn.last_error = nn_ret;
+		}
+		ctxs.nn.status = (nn_ret == 0) ? VIDEO_NN_STOPPED : VIDEO_NN_ERROR;
+	}
 	if (recording) {
 		video_sd_flush_buf(&record_file);
 		fs_close(&record_file);
@@ -654,6 +974,7 @@ static void video_thread_init(const char *video_dev_name)
 	}
 
 	ctxs.vthread[video_index].stop_requested = 0;
+	ctxs.vthread[video_index].video_status = VIDEO_STARTING;
 	ctxs.vthread[video_index].tid = k_thread_create(
 										&ctxs.vthread[video_index].thread_data, thread_stacks[video_index], STACKSIZE,
 										video_task, &ctxs.vthread[video_index], NULL, NULL, PRIORITY, 0, K_NO_WAIT);
@@ -666,6 +987,7 @@ int main(void)
 	LOG_INF("amebapro2 video example\r\n");
 	LOG_INF("Enter the video start video_0/video_1/video_2/video_3 to run the video\r\n");
 	LOG_INF("Enter the video stop video_0/video_1/video_2/video_3 to stop the video\r\n");
+	LOG_INF("Enter 'video nn start' to run live YOLOv4-tiny on video_3\r\n");
 
 	for (int i = 0; i < NUM_THREADS; i++) {
 		ctxs.vthread[i].name = video_names[i];
@@ -682,7 +1004,7 @@ static bool is_valid_video_device(const char *dev_name)
 
 static int cmd_video_start(const struct shell *shell, size_t argc, char **argv)
 {
-	const char *dev_name = argv[1];
+	const char *dev_name;
 	int video_index = 0;
 
 	if (argc != 2) {
@@ -690,6 +1012,7 @@ static int cmd_video_start(const struct shell *shell, size_t argc, char **argv)
 					"video_0, video_1, video_2 or video_3");
 		return -EINVAL;
 	}
+	dev_name = argv[1];
 	LOG_INF("dev_name %s", dev_name);
 
 	if (!is_valid_video_device(dev_name)) {
@@ -701,7 +1024,9 @@ static int cmd_video_start(const struct shell *shell, size_t argc, char **argv)
 
 	if (ctxs.vthread[video_index].video_status == VIDEO_CLOSE) {
 		video_thread_init(dev_name);
-		shell_print(shell, "Video started");
+		shell_print(shell, "Video start requested");
+	} else if (ctxs.vthread[video_index].video_status == VIDEO_STARTING) {
+		shell_print(shell, "Video is starting");
 	} else {
 		shell_print(shell, "Video is open status\r\n");
 	}
@@ -737,7 +1062,7 @@ static int cmd_video_stop(const struct shell *shell, size_t argc, char **argv)
 		return 0;
 	}
 
-	if (ctxs.vthread[video_index].video_status == VIDEO_OPEN) {
+	if (ctxs.vthread[video_index].video_status != VIDEO_CLOSE) {
 		/* Only the owning video_task thread may call video_stream_stop():
 		 * it is the one holding the queued/dequeued buffers. Stopping the
 		 * stream from here would race with the thread's own dequeue/EXIT
@@ -748,6 +1073,85 @@ static int cmd_video_stop(const struct shell *shell, size_t argc, char **argv)
 	} else {
 		shell_print(shell, "Video is close status\r\n");
 	}
+	return 0;
+}
+
+static int cmd_video_nn(const struct shell *shell, size_t argc, char **argv)
+{
+	struct video_nn_context *nn = &ctxs.nn;
+	const char *subcmd;
+	int video_status = ctxs.vthread[VIDEO_NN_CHANNEL].video_status;
+
+	if (argc != 2) {
+		shell_print(shell, "Usage: video nn <start|stop|status>");
+		return -EINVAL;
+	}
+
+	subcmd = argv[1];
+	if (strcmp(subcmd, "start") == 0) {
+		if (nn->status == VIDEO_NN_RUNNING ||
+			nn->status == VIDEO_NN_START_REQUESTED ||
+			nn->status == VIDEO_NN_STARTING) {
+			shell_print(shell, "Live YOLO is already running or starting");
+			return 0;
+		}
+
+		if (nn->status == VIDEO_NN_STOP_REQUESTED) {
+			shell_print(shell, "Live YOLO is stopping; retry after status is STOPPED");
+			return -EBUSY;
+		}
+
+		nn->status = VIDEO_NN_START_REQUESTED;
+		nn->inference_count = 0U;
+		nn->error_count = 0U;
+		nn->last_error = 0;
+		if (video_status == VIDEO_CLOSE) {
+			video_thread_init("video_3");
+			shell_print(shell,
+						"Video+YOLO start requested (starting RGB channel video_3)");
+		} else {
+			shell_print(shell,
+						"Video+YOLO start requested on existing RGB channel video_3");
+		}
+	} else if (strcmp(subcmd, "stop") == 0) {
+		if (nn->status == VIDEO_NN_STOPPED) {
+			shell_print(shell, "Live YOLO is already stopped");
+			return 0;
+		}
+
+		if (nn->status == VIDEO_NN_ERROR) {
+			nn->status = VIDEO_NN_STOPPED;
+			shell_print(shell, "Live YOLO error state cleared; video_3 remains open");
+			return 0;
+		}
+
+		if (video_status == VIDEO_CLOSE) {
+			nn->status = VIDEO_NN_STOPPED;
+			shell_print(shell, "Live YOLO stopped (video_3 is already closed)");
+			return 0;
+		}
+
+		nn->status = VIDEO_NN_STOP_REQUESTED;
+		shell_print(shell, "Live YOLO stop requested; video_3 remains open");
+	} else if (strcmp(subcmd, "status") == 0) {
+		const char *channel_status =
+			video_status == VIDEO_OPEN ? "OPEN" :
+			video_status == VIDEO_STARTING ? "STARTING" : "CLOSED";
+
+		shell_print(shell, "--- Live YOLO status ---");
+		shell_print(shell, "  status: %s", video_nn_status_name(nn->status));
+		shell_print(shell, "  RGB channel: video_3 %s", channel_status);
+		shell_print(shell, "  model: %s", VIDEO_NN_MODEL_FILENAME);
+		shell_print(shell, "  input: %ux%u RGB888 planar",
+					YOLOV4_TINY_INPUT_WIDTH, YOLOV4_TINY_INPUT_HEIGHT);
+		shell_print(shell, "  completed frames: %u", nn->inference_count);
+		shell_print(shell, "  errors: %u", nn->error_count);
+		shell_print(shell, "  last error: %d", nn->last_error);
+	} else {
+		shell_error(shell, "Unknown NN subcmd: %s", subcmd);
+		return -EINVAL;
+	}
+
 	return 0;
 }
 
@@ -956,6 +1360,7 @@ static int cmd_video_md(const struct shell *shell, size_t argc, char **argv)
 
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_video, SHELL_CMD(start, NULL, "Start video", cmd_video_start),
 							   SHELL_CMD(stop, NULL, "Stop video", cmd_video_stop),
+							   SHELL_CMD(nn, NULL, "Live YOLOv4-tiny on video_3 <start|stop|status>", cmd_video_nn),
 							   SHELL_CMD(cmd, NULL, "Video cmd", cmd_video_ctrl),
 							   SHELL_CMD(record, NULL, "Record video [video_0|video_1|video_2|video_3]", cmd_video_record_init),
 							   SHELL_CMD(md, NULL, "Motion detection (video_2 only) <start|stop|sensitivity|ae_stable|status>", cmd_video_md),

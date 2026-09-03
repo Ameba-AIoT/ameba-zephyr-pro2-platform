@@ -18,4 +18,26 @@ module = AMEBA_NPU
 module-str = ameba_npu
 source "subsys/logging/Kconfig.template.log_config"
 
+config AMEBA_NPU_MODEL_FLASH_LOADER
+	bool "Ameba NPU flash model loader"
+	default n
+	help
+	  Load .nb NPU model images from the NN_MDL flash partition, for use
+	  by applications running NPU inference.
+
+config AMEBA_NPU_YOLOV4_TINY_POSTPROCESS
+	bool "YOLOv4-tiny NPU output tensor postprocessing"
+	default n
+	help
+	  Decode YOLOv4-tiny NPU output tensors (box decode + class-aware
+	  DIoU-NMS) into detected objects, for use by applications running
+	  NPU inference.
+
+config AMEBA_NPU_SCRFD_POSTPROCESS
+	bool "SCRFD NPU output tensor postprocessing"
+	default n
+	help
+	  Decode SCRFD NPU output tensors (box decode + NMS) into detected
+	  faces, for use by applications running NPU inference.
+
 endif # NPU_AMEBAPRO2

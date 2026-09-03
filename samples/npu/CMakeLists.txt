@@ -7,7 +7,6 @@ project(npu)
 
 target_sources(app PRIVATE
 	src/main.c
-	src/model_loader/model_flash_loader.c
-	src/model_tensor_process/scrfd_postprocess.c
+	src/model_test_input/horses_416x416_rgb888_planar.c
 	src/model_test_input/wls_rgb888_planar.c
 )
